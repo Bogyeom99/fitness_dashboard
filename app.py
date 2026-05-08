@@ -13,7 +13,6 @@ SESSION_PUSH = "#A78BFA"
 SESSION_PULL = "#2DD4BF"
 SESSION_LEGS = "#F59E0B"
 
-
 st.set_page_config(
     page_title="RUA Fitness Dashboard",
     page_icon="📊",
@@ -164,8 +163,8 @@ def get_latest_text(df, col):
 
 
 def load_data():
-    if not os.path.exists(EXCEL_FILE_PATH):
-        st.error(f"엑셀 파일을 찾을 수 없습니다: {EXCEL_FILE_PATH}")
+    if EXCEL_FILE_PATH is None:
+        st.error("엑셀 파일이 업로드되지 않았습니다.")
         st.stop()
 
     try:
