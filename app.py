@@ -208,7 +208,7 @@ def worksheet_to_dataframe(worksheet):
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_google_sheet_data(spreadsheet_url):
     client = get_gspread_client()
 
