@@ -935,6 +935,196 @@ def build_acsm_hypertrophy_check(calc_workout, weekly_set_target=10):
 
     return weekly_sets
 
+DEFAULT_MUSCLE_GROUPS = [
+    "Chest",
+    "Upper Back",
+    "Lower Back",
+    "Shoulders",
+    "Quadriceps",
+    "Hamstrings",
+    "Hips",
+    "Biceps",
+    "Triceps",
+]
+
+
+def build_this_week_summary(workout, calc_workout, weekly_set_target=10):
+    if workout.empty:
+        return {"has_data": False}
+
+    latest_date = pd.to_datetime(workout["date"].max())
+    week_start = latest_date - pd.to_timedelta(latest_date.weekday(), unit="D")
+    week_end_exclusive = week_start + pd.Timedelta(days=7)
+
+    week_workout = workout[
+        (workout["date"] >= week_start)
+        & (workout["date"] < week_end_exclusive)
+    ].copy()
+
+    if week_workout.empty:
+        return {"has_data": False}
+
+    total_volume = week_workout["raw_volume"].sum()
+    training_days = week_workout["date"].dt.date.nunique()
+    fatigue_sum = week_workout["fatigue_load"].sum(skipna=True)
+
+    session_volume = (
+        week_workout.groupby("session", as_index=False)["raw_volume"]
+        .sum()
+        .sort_values("raw_volume", ascending=False)
+    )
+
+    if session_volume.empty:
+        top_session = "-"
+        top_session_volume = 0
+    else:
+        top_session = session_volume.iloc[0]["session"]
+        top_session_volume = session_volume.iloc[0]["raw_volume"]
+
+    exercise_summary = (
+        week_workout.groupby("exercise", as_index=False)
+        .agg(
+            training_days=("date", lambda x: x.dt.date.nunique()),
+            total_sets=("sets", "sum"),
+            total_volume=("raw_volume", "sum"),
+        )
+        .sort_values(["training_days", "total_volume"], ascending=[False, False])
+    )
+
+    if exercise_summary.empty:
+        top_exercise = "-"
+    else:
+        top_exercise = exercise_summary.iloc[0]["exercise"]
+
+    if calc_workout.empty:
+        insufficient_muscles = []
+        acsm_week = pd.DataFrame()
+    else:
+        calc = calc_workout.copy()
+        calc["week_start"] = pd.to_datetime(calc["week_start"], errors="coerce")
+
+        calc_week = calc[
+            calc["week_start"] == week_start
+        ].copy()
+
+        acsm_week = (
+            calc_week.groupby("muscle_group", as_index=False)["weighted_sets"]
+            .sum()
+            if not calc_week.empty
+            else pd.DataFrame(columns=["muscle_group", "weighted_sets"])
+        )
+
+        acsm_week = pd.DataFrame({"muscle_group": DEFAULT_MUSCLE_GROUPS}).merge(
+            acsm_week,
+            on="muscle_group",
+            how="left",
+        )
+
+        acsm_week["weighted_sets"] = acsm_week["weighted_sets"].fillna(0)
+        acsm_week["target_sets"] = weekly_set_target
+        acsm_week["set_gap"] = acsm_week["weighted_sets"] - acsm_week["target_sets"]
+        acsm_week["status"] = np.where(
+            acsm_week["weighted_sets"] >= weekly_set_target,
+            "충분",
+            "부족",
+        )
+
+        insufficient_muscles = acsm_week[
+            acsm_week["status"] == "부족"
+        ]["muscle_group"].tolist()
+
+    progression_df = build_progression_recommendations(workout, recent_n=3)
+
+    if progression_df.empty:
+        progression_candidates = pd.DataFrame()
+    else:
+        progression_candidates = progression_df[
+            progression_df["recommendation"].str.contains(
+                "증량 권장|소폭 증량 검토",
+                na=False,
+            )
+        ].copy()
+
+    return {
+        "has_data": True,
+        "week_start": week_start,
+        "week_end": week_end_exclusive - pd.Timedelta(days=1),
+        "week_label": f"{week_start.strftime('%Y-%m-%d')} ~ {(week_end_exclusive - pd.Timedelta(days=1)).strftime('%Y-%m-%d')}",
+        "total_volume": total_volume,
+        "training_days": training_days,
+        "fatigue_sum": fatigue_sum,
+        "top_session": top_session,
+        "top_session_volume": top_session_volume,
+        "top_exercise": top_exercise,
+        "insufficient_muscles": insufficient_muscles,
+        "insufficient_count": len(insufficient_muscles),
+        "progression_candidates": progression_candidates,
+        "progression_count": len(progression_candidates),
+        "acsm_week": acsm_week,
+    }
+
+
+def render_this_week_summary(summary):
+    st.markdown("### 이번 주 요약")
+
+    if not summary.get("has_data", False):
+        st.info("이번 주 요약을 표시할 운동 데이터가 없습니다.")
+        return
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    with col1:
+        st.metric("기준 주차", summary["week_label"])
+
+    with col2:
+        st.metric("총 훈련 볼륨", f"{summary['total_volume']:,.0f} kg")
+
+    with col3:
+        st.metric("운동 수행일", f"{summary['training_days']} 일")
+
+    with col4:
+        st.metric("주요 세션", str(summary["top_session"]))
+
+    with col5:
+        st.metric("누적 피로도", f"{summary['fatigue_sum']:,.0f}")
+
+    col6, col7 = st.columns(2)
+
+    with col6:
+        st.markdown("#### 근비대 기준 부족 부위")
+
+        if summary["insufficient_count"] == 0:
+            st.success("이번 주는 모든 근육군이 기준 세트를 충족했습니다.")
+        else:
+            insufficient_text = ", ".join(summary["insufficient_muscles"])
+            st.warning(
+                f"{summary['insufficient_count']}개 근육군 부족: {insufficient_text}"
+            )
+
+    with col7:
+        st.markdown("#### 증량 검토 운동")
+
+        if summary["progression_count"] == 0:
+            st.info("현재 기준으로 뚜렷한 증량 후보 운동이 없습니다.")
+        else:
+            st.warning(
+                f"{summary['progression_count']}개 운동에서 증량 검토 가능"
+            )
+
+            st.dataframe(
+                summary["progression_candidates"][
+                    [
+                        "session",
+                        "exercise",
+                        "latest_weight",
+                        "latest_total_reps",
+                        "latest_rpe",
+                        "recommendation",
+                    ]
+                ],
+                width="stretch",
+                hide_index=True,
+            )
 
 # =========================================================
 # Prepare data
@@ -1059,6 +1249,13 @@ with st.expander("데이터 검증 결과 보기"):
     st.write("Google Sheets 시트 목록:", sheet_names)
     st.dataframe(validation, width="stretch")
 
+this_week_summary = build_this_week_summary(
+    workout=workout,
+    calc_workout=calc_workout,
+    weekly_set_target=ACSM_WEEKLY_SET_TARGET,
+)
+
+render_this_week_summary(this_week_summary)
 
 tab_inbody, tab_workout, tab_muscle, tab_raw = st.tabs(
     ["인바디 변화", "운동 변화", "근육군 분석", "원자료 확인"]
