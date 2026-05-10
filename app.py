@@ -446,8 +446,22 @@ def clean_workout(workout, exercise_master, rpe_scale):
     ].rename(columns={"session": "session_master"})
 
     workout = workout.merge(master_lookup, on="exercise", how="left")
-    workout["session"] = workout["session"].fillna(workout["session_master"])
+    
+    # Google Sheets formula error values should not be treated as valid sessions.
+    invalid_session = (
+        workout["session"].isna()
+        | workout["session"].astype(str).str.strip().isin(
+            ["", "nan", "NaN", "None", "#N/A", "#ERROR!", "#REF!", "#VALUE!", "#DIV/0!", "미등록"]
+        )
+        | workout["session"].astype(str).str.startswith("#")
+    )
+    
+    workout.loc[invalid_session, "session"] = workout.loc[invalid_session, "session_master"]
+    
+    # If EXERCISE_MASTER has a valid session, use it as the source of truth.
+    workout["session"] = workout["session_master"].fillna(workout["session"])
     workout["session"] = workout["session"].fillna("미등록")
+    
     workout = workout.drop(columns=["session_master"])
 
     rpe_scale["rpe"] = safe_numeric(rpe_scale["rpe"])
