@@ -1,24 +1,27 @@
-from io import BytesIO
-from pathlib import Path
 from datetime import datetime
 
 import altair as alt
+import gspread
 import numpy as np
 import pandas as pd
 import streamlit as st
+from google.oauth2.service_account import Credentials
 
-LOCAL_EXCEL_PATH = Path("data/rua_fitness.xlsx")
+
 ACSM_WEEKLY_SET_TARGET = 10
+
 PRIMARY_PURPLE = "#A78BFA"
 SESSION_PUSH = "#A78BFA"
 SESSION_PULL = "#2DD4BF"
 SESSION_LEGS = "#F59E0B"
+
 
 st.set_page_config(
     page_title="RUA Fitness Dashboard",
     page_icon="📊",
     layout="wide",
 )
+
 
 st.markdown(
     """
@@ -127,80 +130,138 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 # =========================================================
-# File loading
+# Google Sheets connection
 # =========================================================
 
-st.sidebar.title("데이터 로딩")
+REQUIRED_INPUT_SHEETS = [
+    "INBODY_LOG",
+    "WORKOUT_LOG",
+    "EXERCISE_MASTER",
+    "MUSCLE_WEIGHT",
+    "RPE_SCALE",
+]
 
-uploaded_file = st.sidebar.file_uploader(
-    "rua_fitness.xlsx 업로드",
-    type=["xlsx"],
-)
 
-if uploaded_file is not None:
-    EXCEL_FILE_BYTES = uploaded_file.getvalue()
-    DATA_SOURCE_TEXT = f"업로드 파일: {uploaded_file.name}"
-else:
-    if LOCAL_EXCEL_PATH.exists():
-        EXCEL_FILE_BYTES = LOCAL_EXCEL_PATH.read_bytes()
-        DATA_SOURCE_TEXT = f"로컬 파일: {LOCAL_EXCEL_PATH}"
-    else:
-        st.warning("엑셀 파일을 업로드하세요.")
+def get_service_account_info():
+    if "gcp_service_account" not in st.secrets:
+        st.error("Streamlit Secrets에 [gcp_service_account]가 없습니다.")
         st.stop()
 
-@st.cache_data
-def get_sheet_names(file_bytes):
-    excel_file = pd.ExcelFile(BytesIO(file_bytes), engine="openpyxl")
-    return excel_file.sheet_names
+    info = dict(st.secrets["gcp_service_account"])
 
-def get_sheet_map(sheet_names):
-    return {str(name).strip(): name for name in sheet_names}
+    private_key = info.get("private_key", "")
+    if "\\n" in private_key:
+        info["private_key"] = private_key.replace("\\n", "\n")
+
+    return info
 
 
-def read_excel_sheet(file_bytes, sheet_name, sheet_map):
-    clean_name = str(sheet_name).strip()
+def get_spreadsheet_url():
+    if "spreadsheet_url" not in st.secrets:
+        st.error("Streamlit Secrets에 spreadsheet_url이 없습니다.")
+        st.stop()
 
-    if clean_name not in sheet_map:
-        raise KeyError(
-            f"'{sheet_name}' 시트를 찾을 수 없습니다. "
-            f"업로드된 시트 목록: {list(sheet_map.keys())}"
-        )
+    return str(st.secrets["spreadsheet_url"]).strip()
 
-    real_sheet_name = sheet_map[clean_name]
 
-    return pd.read_excel(
-        BytesIO(file_bytes),
-        sheet_name=real_sheet_name,
-        engine="openpyxl",
+def get_gspread_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+
+    credentials = Credentials.from_service_account_info(
+        get_service_account_info(),
+        scopes=scopes,
     )
 
-try:
-    SHEET_NAMES = get_sheet_names(EXCEL_FILE_BYTES)
-    SHEET_MAP = get_sheet_map(SHEET_NAMES)
-except Exception as error:
-    st.error(f"엑셀 파일을 읽는 중 오류가 발생했습니다: {error}")
-    st.stop()
+    return gspread.authorize(credentials)
 
-with st.sidebar.expander("업로드된 시트 목록", expanded=False):
-    st.write(SHEET_NAMES)
+
+def worksheet_to_dataframe(worksheet):
+    values = worksheet.get_all_values()
+
+    if not values:
+        return pd.DataFrame()
+
+    header = [str(col).strip() for col in values[0]]
+
+    rows = []
+    for row in values[1:]:
+        if len(row) < len(header):
+            row = row + [""] * (len(header) - len(row))
+        elif len(row) > len(header):
+            row = row[: len(header)]
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=header)
+
+    empty_header_cols = [col for col in df.columns if col == ""]
+    if empty_header_cols:
+        df = df.drop(columns=empty_header_cols)
+
+    df = df.replace(r"^\s*$", np.nan, regex=True)
+
+    return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_google_sheet_data(spreadsheet_url):
+    client = get_gspread_client()
+
+    try:
+        spreadsheet = client.open_by_url(spreadsheet_url)
+    except Exception as error:
+        st.error(f"Google Sheets를 여는 중 오류가 발생했습니다: {error}")
+        st.stop()
+
+    worksheets = spreadsheet.worksheets()
+    sheet_names = [worksheet.title for worksheet in worksheets]
+    sheet_map = {str(name).strip(): name for name in sheet_names}
+
+    missing_sheets = [sheet for sheet in REQUIRED_INPUT_SHEETS if sheet not in sheet_map]
+
+    if missing_sheets:
+        st.error(
+            "필수 입력 시트를 찾을 수 없습니다. "
+            f"누락 시트: {missing_sheets}. "
+            f"현재 시트 목록: {list(sheet_map.keys())}"
+        )
+        st.stop()
+
+    data = {}
+
+    for required_sheet in REQUIRED_INPUT_SHEETS:
+        real_sheet_name = sheet_map[required_sheet]
+        worksheet = spreadsheet.worksheet(real_sheet_name)
+        data[required_sheet] = worksheet_to_dataframe(worksheet)
+
+    return data, sheet_names
+
 
 # =========================================================
 # Basic utilities
 # =========================================================
-
-def safe_numeric(series):
-    return pd.to_numeric(series, errors="coerce")
 
 def normalize_columns(df):
     df = df.copy()
     df.columns = [str(col).strip() for col in df.columns]
     return df
 
+
+def safe_numeric(series):
+    clean_series = series.astype(str).str.replace(",", "", regex=False)
+    return pd.to_numeric(clean_series, errors="coerce")
+
+
 def format_number(value, digits=1):
     if pd.isna(value):
         return "-"
     return f"{value:.{digits}f}"
+
 
 def get_latest_text(df, col):
     if col not in df.columns or df.empty:
@@ -213,6 +274,7 @@ def get_latest_text(df, col):
 
     return str(value)
 
+
 def change_text(value, name, unit):
     if pd.isna(value):
         return "이전 측정값 없음"
@@ -224,6 +286,7 @@ def change_text(value, name, unit):
         return f"{name}이 전보다 {abs(value):.1f}{unit} 감소했어요"
 
     return f"{name} 변화가 없어요"
+
 
 def classify_body_composition(row):
     weight_th = 0.3
@@ -261,36 +324,10 @@ def classify_body_composition(row):
 
     return "Maintenance"
 
+
 # =========================================================
-# Data loading and cleaning
+# Data cleaning and calculation
 # =========================================================
-
-def load_required_input_sheets():
-    required_input_sheets = [
-        "INBODY_LOG",
-        "WORKOUT_LOG",
-        "EXERCISE_MASTER",
-        "MUSCLE_WEIGHT",
-        "RPE_SCALE",
-    ]
-
-    missing = [sheet for sheet in required_input_sheets if sheet not in SHEET_MAP]
-
-    if missing:
-        st.error(
-            "필수 입력 시트를 찾을 수 없습니다. "
-            f"누락 시트: {missing}. "
-            f"업로드된 시트 목록: {list(SHEET_MAP.keys())}"
-        )
-        st.stop()
-
-    inbody = read_excel_sheet(EXCEL_FILE_BYTES, "INBODY_LOG", SHEET_MAP)
-    workout = read_excel_sheet(EXCEL_FILE_BYTES, "WORKOUT_LOG", SHEET_MAP)
-    exercise_master = read_excel_sheet(EXCEL_FILE_BYTES, "EXERCISE_MASTER", SHEET_MAP)
-    muscle_weight = read_excel_sheet(EXCEL_FILE_BYTES, "MUSCLE_WEIGHT", SHEET_MAP)
-    rpe_scale = read_excel_sheet(EXCEL_FILE_BYTES, "RPE_SCALE", SHEET_MAP)
-
-    return inbody, workout, exercise_master, muscle_weight, rpe_scale
 
 def clean_inbody(inbody):
     inbody = normalize_columns(inbody)
@@ -327,6 +364,24 @@ def clean_inbody(inbody):
     inbody["body_composition_type"] = inbody.apply(classify_body_composition, axis=1)
 
     return inbody
+
+
+def clean_muscle_weight(muscle_weight):
+    muscle_weight = normalize_columns(muscle_weight)
+
+    required_cols = ["exercise", "muscle_group", "ratio"]
+
+    for col in required_cols:
+        if col not in muscle_weight.columns:
+            st.error(f"MUSCLE_WEIGHT에 '{col}' 컬럼이 없습니다.")
+            st.stop()
+
+    muscle_weight["exercise"] = muscle_weight["exercise"].astype(str).str.strip()
+    muscle_weight["muscle_group"] = muscle_weight["muscle_group"].astype(str).str.strip()
+    muscle_weight["ratio"] = safe_numeric(muscle_weight["ratio"])
+
+    return muscle_weight
+
 
 def clean_workout(workout, exercise_master, rpe_scale):
     workout = normalize_columns(workout)
@@ -421,21 +476,6 @@ def clean_workout(workout, exercise_master, rpe_scale):
 
     return workout, exercise_master, rpe_scale
 
-def clean_muscle_weight(muscle_weight):
-    muscle_weight = normalize_columns(muscle_weight)
-
-    required_cols = ["exercise", "muscle_group", "ratio"]
-
-    for col in required_cols:
-        if col not in muscle_weight.columns:
-            st.error(f"MUSCLE_WEIGHT에 '{col}' 컬럼이 없습니다.")
-            st.stop()
-
-    muscle_weight["exercise"] = muscle_weight["exercise"].astype(str).str.strip()
-    muscle_weight["muscle_group"] = muscle_weight["muscle_group"].astype(str).str.strip()
-    muscle_weight["ratio"] = safe_numeric(muscle_weight["ratio"])
-
-    return muscle_weight
 
 def validate_data(workout, exercise_master, muscle_weight):
     workout_exercises = set(workout["exercise"].dropna().unique())
@@ -496,7 +536,8 @@ def validate_data(workout, exercise_master, muscle_weight):
 
     return validation
 
-def build_calc_workout(workout, exercise_master, muscle_weight):
+
+def build_calc_workout(workout, muscle_weight):
     calc = workout.merge(
         muscle_weight[["exercise", "muscle_group", "ratio"]],
         on="exercise",
@@ -514,6 +555,7 @@ def build_calc_workout(workout, exercise_master, muscle_weight):
 
     return calc
 
+
 def build_muscle_weekly(calc):
     muscle_weekly = (
         calc.groupby(["week_start", "muscle_group"], as_index=False)
@@ -527,19 +569,37 @@ def build_muscle_weekly(calc):
 
     return muscle_weekly
 
-@st.cache_data
-def prepare_dashboard_data(file_bytes, sheet_names_tuple):
-    inbody, workout, exercise_master, muscle_weight, rpe_scale = load_required_input_sheets()
+
+@st.cache_data(ttl=300, show_spinner=False)
+def prepare_dashboard_data(spreadsheet_url):
+    raw_data, sheet_names = load_google_sheet_data(spreadsheet_url)
+
+    inbody = raw_data["INBODY_LOG"]
+    workout = raw_data["WORKOUT_LOG"]
+    exercise_master = raw_data["EXERCISE_MASTER"]
+    muscle_weight = raw_data["MUSCLE_WEIGHT"]
+    rpe_scale = raw_data["RPE_SCALE"]
 
     inbody = clean_inbody(inbody)
     muscle_weight = clean_muscle_weight(muscle_weight)
     workout, exercise_master, rpe_scale = clean_workout(workout, exercise_master, rpe_scale)
 
     validation = validate_data(workout, exercise_master, muscle_weight)
-    calc = build_calc_workout(workout, exercise_master, muscle_weight)
+    calc = build_calc_workout(workout, muscle_weight)
     muscle_weekly = build_muscle_weekly(calc)
 
-    return inbody, workout, exercise_master, muscle_weight, rpe_scale, validation, calc, muscle_weekly
+    return (
+        inbody,
+        workout,
+        exercise_master,
+        muscle_weight,
+        rpe_scale,
+        validation,
+        calc,
+        muscle_weekly,
+        sheet_names,
+    )
+
 
 # =========================================================
 # Chart settings
@@ -550,6 +610,7 @@ def session_color_scale():
         domain=["밀기", "당기기", "하체"],
         range=[SESSION_PUSH, SESSION_PULL, SESSION_LEGS],
     )
+
 
 def muscle_color_scale():
     return alt.Scale(
@@ -576,6 +637,7 @@ def muscle_color_scale():
             "#F472B6",
         ],
     )
+
 
 def make_inbody_line_chart(inbody_filtered):
     chart_df = inbody_filtered[
@@ -614,6 +676,7 @@ def make_inbody_line_chart(inbody_filtered):
         )
         .properties(height=430)
     )
+
 
 def make_inbody_change_chart(inbody_filtered):
     required_cols = ["date", "weight_diff", "skeletal_muscle_diff", "body_fat_pct_diff"]
@@ -661,6 +724,7 @@ def make_inbody_change_chart(inbody_filtered):
         .properties(height=360)
     )
 
+
 def make_fatigue_chart(workout_filtered):
     fatigue_daily = workout_filtered.dropna(subset=["fatigue_load"]).copy()
 
@@ -689,6 +753,7 @@ def make_fatigue_chart(workout_filtered):
         .properties(height=350)
     )
 
+
 def make_muscle_volume_line_chart(muscle_weekly_filtered):
     return (
         alt.Chart(muscle_weekly_filtered.copy())
@@ -705,6 +770,7 @@ def make_muscle_volume_line_chart(muscle_weekly_filtered):
         )
         .properties(height=440)
     )
+
 
 def make_muscle_stimulus_line_chart(muscle_weekly_filtered):
     chart_df = muscle_weekly_filtered.dropna(subset=["stimulus_score"]).copy()
@@ -728,6 +794,7 @@ def make_muscle_stimulus_line_chart(muscle_weekly_filtered):
         .properties(height=440)
     )
 
+
 def build_frequent_exercise_summary(workout_filtered):
     return (
         workout_filtered.groupby(["session", "exercise"], as_index=False)
@@ -746,9 +813,13 @@ def build_frequent_exercise_summary(workout_filtered):
         )
     )
 
+
 def build_progression_recommendations(workout_filtered, recent_n=3):
+    daily_exercise = workout_filtered.copy()
+    daily_exercise["date_only"] = daily_exercise["date"].dt.normalize()
+
     daily_exercise = (
-        workout_filtered.groupby(["date", "session", "exercise"], as_index=False)
+        daily_exercise.groupby(["date_only", "session", "exercise"], as_index=False)
         .agg(
             total_sets=("sets", "sum"),
             total_reps=("reps", "sum"),
@@ -756,6 +827,7 @@ def build_progression_recommendations(workout_filtered, recent_n=3):
             avg_rpe=("rpe", "mean"),
             total_volume=("raw_volume", "sum"),
         )
+        .rename(columns={"date_only": "date"})
         .sort_values(["exercise", "date"])
     )
 
@@ -834,6 +906,7 @@ def build_progression_recommendations(workout_filtered, recent_n=3):
     result["priority"] = result["recommendation"].apply(get_priority)
     return result.sort_values(["priority", "session", "exercise"])
 
+
 def build_acsm_hypertrophy_check(calc_workout, weekly_set_target=10):
     if calc_workout.empty:
         return pd.DataFrame()
@@ -862,32 +935,41 @@ def build_acsm_hypertrophy_check(calc_workout, weekly_set_target=10):
 
     return weekly_sets
 
+
 # =========================================================
 # Prepare data
 # =========================================================
 
-(
-    inbody,
-    workout,
-    exercise_master,
-    muscle_weight,
-    rpe_scale,
-    validation,
-    calc_workout,
-    muscle_weekly,
-) = prepare_dashboard_data(EXCEL_FILE_BYTES, tuple(SHEET_NAMES))
+SPREADSHEET_URL = get_spreadsheet_url()
+
+try:
+    (
+        inbody,
+        workout,
+        exercise_master,
+        muscle_weight,
+        rpe_scale,
+        validation,
+        calc_workout,
+        muscle_weekly,
+        sheet_names,
+    ) = prepare_dashboard_data(SPREADSHEET_URL)
+except Exception as error:
+    st.error(f"Google Sheets 데이터 처리 중 오류가 발생했습니다: {error}")
+    st.stop()
 
 
 if st.sidebar.button("데이터 새로고침"):
     st.cache_data.clear()
     st.rerun()
 
+
 # =========================================================
 # Filters
 # =========================================================
 
 st.sidebar.title("필터")
-st.sidebar.caption(DATA_SOURCE_TEXT)
+st.sidebar.caption("데이터 소스: Google Sheets")
 
 min_date = min(
     inbody["date"].min() if not inbody.empty else pd.Timestamp.today(),
@@ -955,6 +1037,7 @@ if not calc_workout.empty:
 else:
     calc_workout_filtered = pd.DataFrame()
 
+
 # =========================================================
 # Layout
 # =========================================================
@@ -971,13 +1054,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 with st.expander("데이터 검증 결과 보기"):
-    st.write("업로드된 시트 목록:", SHEET_NAMES)
+    st.write("Google Sheets 시트 목록:", sheet_names)
     st.dataframe(validation, width="stretch")
+
 
 tab_inbody, tab_workout, tab_muscle, tab_raw = st.tabs(
     ["인바디 변화", "운동 변화", "근육군 분석", "원자료 확인"]
 )
+
 
 with tab_inbody:
     st.subheader("인바디 체성분 변화")
@@ -1034,6 +1120,7 @@ with tab_inbody:
 
         st.markdown("### 인바디 기록")
         st.dataframe(inbody_filtered, width="stretch")
+
 
 with tab_workout:
     st.subheader("운동 변화")
@@ -1238,6 +1325,7 @@ with tab_workout:
                 width="stretch",
             )
 
+
 with tab_muscle:
     st.subheader("근육군별 분석")
 
@@ -1365,6 +1453,7 @@ with tab_muscle:
         st.markdown("### 근육군 주간 요약표")
         st.dataframe(muscle_weekly_filtered, width="stretch")
 
+
 with tab_raw:
     st.subheader("원자료 확인")
 
@@ -1382,5 +1471,6 @@ with tab_raw:
         st.info("CALC_WORKOUT 표시 데이터가 없습니다.")
     else:
         st.dataframe(calc_workout_filtered, width="stretch")
+
 
 st.caption(f"Last refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
